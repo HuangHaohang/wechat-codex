@@ -98,7 +98,7 @@ codex --version
 ### 2. 安装依赖
 
 ```powershell
-git clone <your-repo-url>
+git clone https://github.com/HuangHaohang/wechat-codex.git
 cd wechat-codex
 npm install
 npm run build
