@@ -1,0 +1,15 @@
+# Project-local Codex config for wechat-codex.
+# This file is intentionally separate from ~/.codex/config.toml.
+# Edit this file after cloning. Keep secrets in environment variables, not here.
+
+model_provider = "openai"
+model = "gpt-5.4"
+model_reasoning_effort = "high"
+personality = "pragmatic"
+
+# Example custom provider:
+# [model_providers.custom]
+# name = "Custom"
+# base_url = "https://your-openai-compatible-gateway.example/v1"
+# env_key = "YOUR_CUSTOM_API_KEY"
+# wire_api = "responses"
