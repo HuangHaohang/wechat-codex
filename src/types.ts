@@ -63,6 +63,8 @@ export interface ProviderQueryOptions {
   provider?: string;
   model?: string;
   workspace?: string;
+  sandboxMode?: SandboxMode;
+  approvalPolicy?: ApprovalPolicy;
   reasoningEffort?: ReasoningEffort;
   personality?: Personality;
   systemPrompt?: string;
@@ -80,10 +82,20 @@ export interface ProviderImageResult {
   revisedPrompt?: string;
 }
 
+export interface ProviderApprovalRequest {
+  reason: string;
+  suggestedSandbox: SandboxMode;
+}
+
+export interface ProviderQueryResult {
+  text: string;
+  approvalRequest?: ProviderApprovalRequest;
+}
+
 export interface Provider {
   readonly name: string;
   readonly type: ProviderType;
-  query(prompt: string, options: ProviderQueryOptions): Promise<{ text: string }>;
+  query(prompt: string, options: ProviderQueryOptions): Promise<ProviderQueryResult>;
   listModels?(): Promise<ModelCatalogEntry[]>;
   getCapabilities?(): Promise<ProviderCapabilities>;
   generateImage?(prompt: string, model: string): Promise<ProviderImageResult>;

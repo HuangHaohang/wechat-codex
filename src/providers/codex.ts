@@ -8,9 +8,12 @@ import { createLogger } from "../logger.js";
 import type {
   ModelCatalogEntry,
   Provider,
+  ProviderApprovalRequest,
   ProviderCapabilities,
   ProviderConfig,
+  ProviderQueryResult,
   ProviderQueryOptions,
+  SandboxMode,
 } from "../types.js";
 
 const log = createLogger("codex");
@@ -35,7 +38,7 @@ export class CodexProvider implements Provider {
     private readonly config: ProviderConfig,
   ) {}
 
-  async query(prompt: string, options: ProviderQueryOptions): Promise<{ text: string }> {
+  async query(prompt: string, options: ProviderQueryOptions): Promise<ProviderQueryResult> {
     const tempDir = await mkdtemp(join(tmpdir(), "wechat-codex-"));
     const outputFile = join(tempDir, "last-message.txt");
 
@@ -44,12 +47,14 @@ export class CodexProvider implements Provider {
       const env = buildCodexEnv(this.config, options.codexHome);
       log.info(
         `Querying ${options.provider || "codex"} `
-        + `(model: ${options.model || "(provider default)"}, session: ${options.sessionId})`,
+        + `(model: ${options.model || "(provider default)"}, session: ${options.sessionId}, `
+        + `sandbox: ${options.sandboxMode || "read-only"}, approval: ${options.approvalPolicy || "never"})`,
       );
       const { stdout, stderr } = await runCommand(this.getCommand(), args, env, prompt);
-      const text = await parseResult(stdout, stderr, outputFile);
+      const result = await parseResult(stdout, stderr, outputFile, options.sandboxMode || "read-only");
+      const text = result.text;
       log.info(`Response: ${text.length} chars`);
-      return { text };
+      return result;
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
@@ -72,12 +77,14 @@ export class CodexProvider implements Provider {
   }
 
   private buildArgs(options: ProviderQueryOptions, outputFile: string): string[] {
+    const sandboxMode = options.sandboxMode || "read-only";
+    const approvalPolicy = options.approvalPolicy || "never";
     const args = [
       "--json",
       "-c",
-      "sandbox_mode=\"workspace-write\"",
+      `sandbox_mode=${JSON.stringify(sandboxMode)}`,
       "-c",
-      "approval_policy=\"never\"",
+      `approval_policy=${JSON.stringify(approvalPolicy)}`,
       "-o",
       outputFile,
     ];
@@ -108,7 +115,12 @@ export class CodexProvider implements Provider {
   }
 }
 
-async function parseResult(stdout: string, stderr: string, outputFile: string): Promise<string> {
+async function parseResult(
+  stdout: string,
+  stderr: string,
+  outputFile: string,
+  sandboxMode: SandboxMode,
+): Promise<ProviderQueryResult> {
   let text = "";
   let jsonError = "";
 
@@ -148,7 +160,42 @@ async function parseResult(stdout: string, stderr: string, outputFile: string): 
     throw new Error(jsonError || cleaned || "Codex returned no final message");
   }
 
-  return text;
+  return {
+    text,
+    approvalRequest: detectApprovalRequest(stderr, text, sandboxMode),
+  };
+}
+
+function detectApprovalRequest(
+  stderr: string,
+  text: string,
+  sandboxMode: SandboxMode,
+): ProviderApprovalRequest | undefined {
+  const stderrLines = stderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const rejectionLine = stderrLines.find((line) => /rejected by user approval settings/i.test(line));
+  const englishPermissionText = /read-only|approvals are disabled|outside of the project|outside (this|the) workspace/i.test(text);
+  const chinesePermissionText = /(\u53ea\u8bfb|\u53ef\u5199\u6a21\u5f0f|\u5199\u6a21\u5f0f|\u6ca1\u6709\u5199\u6743\u9650|\u65e0\u6cd5\u5199\u5165|\u65e0\u6cd5\u521b\u5efa\u6587\u4ef6|\u65e0\u6cd5\u4fee\u6539\u6587\u4ef6|\u4e0d\u80fd\u76f4\u63a5\u521b\u5efa|\u4e0d\u80fd\u76f4\u63a5\u5728|\u65e0\u6cd5\u76f4\u63a5\u5728|\u5207\u5230\u53ef\u5199\u6a21\u5f0f)/.test(text);
+  const permissionText = englishPermissionText || chinesePermissionText;
+  const blockedByPermissions = Boolean(rejectionLine) || permissionText;
+  if (!blockedByPermissions) {
+    return undefined;
+  }
+
+  return {
+    reason: rejectionLine || "The task was blocked by the current permission settings.",
+    suggestedSandbox: nextSandboxMode(sandboxMode),
+  };
+}
+
+function nextSandboxMode(current: SandboxMode): SandboxMode {
+  if (current === "read-only") {
+    return "workspace-write";
+  }
+  return "danger-full-access";
 }
 
 async function runCommand(

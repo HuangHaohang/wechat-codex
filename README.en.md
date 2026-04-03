@@ -201,6 +201,12 @@ node dist/cli.js logs -f
 - `/reasoning minimal|low|medium|high|xhigh|default`
 - `/personality`
 - `/personality none|friendly|pragmatic|default`
+- `/sandbox`
+- `/sandbox read-only|workspace-write|danger-full-access|default`
+- `/approval`
+- `/approval never|on-request|default`
+- `/approve [workspace-write|danger-full-access]`
+- `/deny`
 - `/plan`
 - `/plan on|off|default`
 - `/search`
@@ -406,7 +412,8 @@ But the most complete end-to-end validation so far has still been on Windows, so
 - `allowedWorkspaceRoots` is the first boundary; keep it limited to directories you are willing to expose
 - never commit provider secrets into the repo; use environment variables
 - only template files under `codex-home` should be committed; do not commit auth, history, sessions, sqlite, logs, or other runtime state
-- the current `CodexProvider` runs with `workspace-write` and `approval never` by default, which is a high-trust default and should be treated as such
+- the current `CodexProvider` defaults to `read-only` plus `approval never`
+- grant more access explicitly from WeChat with `/sandbox workspace-write` or `/sandbox danger-full-access`
 - once MCP servers are connected, they expand the tool surface available to the session; verify command sources, permissions, and secret handling before enabling them
 
 ## Contact

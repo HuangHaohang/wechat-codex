@@ -201,6 +201,12 @@ node dist/cli.js logs -f
 - `/reasoning minimal|low|medium|high|xhigh|default`
 - `/personality`
 - `/personality none|friendly|pragmatic|default`
+- `/sandbox`
+- `/sandbox read-only|workspace-write|danger-full-access|default`
+- `/approval`
+- `/approval never|on-request|default`
+- `/approve [workspace-write|danger-full-access]`
+- `/deny`
 - `/plan`
 - `/plan on|off|default`
 - `/search`
@@ -406,7 +412,8 @@ node dist/cli.js logout
 - `allowedWorkspaceRoots` 是第一层边界，务必只加入你愿意暴露给机器人的目录
 - provider 密钥不要写进仓库，应该使用环境变量
 - 项目内 `codex-home` 只应提交模板文件，不要提交 auth、history、sessions、sqlite、logs 等运行态文件
-- 当前 `CodexProvider` 默认以 `workspace-write` 和 `approval never` 运行，这是高权限默认值，部署前要明确接受这个风险
+- 当前 `CodexProvider` 默认是 `read-only` 加 `approval never`
+- 如果要放权，需要在微信里显式发送 `/sandbox workspace-write` 或 `/sandbox danger-full-access`
 - MCP server 一旦接入，就相当于把额外工具能力暴露给会话；接入前应确认命令来源、权限边界和密钥管理
 
 ## 联系方式

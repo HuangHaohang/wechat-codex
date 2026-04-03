@@ -5,6 +5,7 @@ import type {
   MediaAttachment,
   ModelCatalogEntry,
   Provider,
+  ProviderQueryResult,
   ProviderCapabilities,
   ProviderConfig,
   ProviderImageResult,
@@ -60,7 +61,7 @@ export class OpenAICompatibleProvider implements Provider {
     private readonly config: ProviderConfig,
   ) {}
 
-  async query(prompt: string, options: ProviderQueryOptions): Promise<{ text: string }> {
+  async query(prompt: string, options: ProviderQueryOptions): Promise<ProviderQueryResult> {
     const model = options.model || this.config.defaultModel;
     if (!model) {
       throw new Error(`Provider "${this.name}" has no model configured.`);

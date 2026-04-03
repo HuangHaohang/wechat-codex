@@ -14,6 +14,7 @@ import type {
   Channel,
   Context,
   InboundMessage,
+  MediaAttachment,
   Middleware,
   NextFunction,
   OutboundMessage,
@@ -38,6 +39,22 @@ interface MessageBuffer {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface PendingApproval {
+  sessionId: string;
+  prompt: string;
+  media?: MediaAttachment[];
+  workspace: string;
+  provider: string;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
+  personality?: Personality;
+  systemPrompt?: string;
+  search: boolean;
+  suggestedSandbox: SandboxMode;
+  reason: string;
+  createdAt: number;
+}
+
 export class Gateway {
   private readonly channels = new Map<string, Channel>();
   private readonly providers = new Map<string, Provider>();
@@ -48,6 +65,7 @@ export class Gateway {
   private readonly queueNoticeSent = new Set<string>();
   private readonly seenMessages = new Map<string, number>();
   private readonly sentReplies = new Map<string, number>();
+  private readonly pendingApprovals = new Map<string, PendingApproval>();
   private readonly mcp = new McpManager();
 
   constructor(private readonly config: WechatCodexConfig) {}
@@ -221,6 +239,12 @@ export class Gateway {
             "/reasoning minimal|low|medium|high|xhigh|default",
             "/personality - show current personality",
             "/personality none|friendly|pragmatic|default",
+            "/sandbox - show current sandbox mode",
+            "/sandbox read-only|workspace-write|danger-full-access|default",
+            "/approval - show current approval policy",
+            "/approval never|on-request|default",
+            "/approve [workspace-write|danger-full-access] - rerun the pending task once with more access",
+            "/deny - discard the pending approval request",
             "/review [instructions] - run codex review on current workspace changes",
             "/fork [name] - switch to a new local thread name",
             "/plan - show current plan mode",
@@ -252,6 +276,9 @@ export class Gateway {
             `thread: ${preference.thread}`,
             `reasoning: ${preference.reasoningEffort || "(default)"}`,
             `personality: ${preference.personality || "(default)"}`,
+            `sandbox: ${preference.sandboxMode}`,
+            `approval: ${preference.approvalPolicy}`,
+            `pending approval: ${this.pendingApprovals.has(this.sessionKey(message)) ? "yes" : "no"}`,
             `plan mode: ${preference.planMode ? "on" : "off"}`,
             `search: ${preference.search ? "on" : "off"}`,
             `skill: ${skill}`,
@@ -288,6 +315,22 @@ export class Gateway {
 
       case "/personality":
         await this.handlePersonalityCommand(channel, message, arg);
+        return;
+
+      case "/sandbox":
+        await this.handleSandboxCommand(channel, message, arg);
+        return;
+
+      case "/approval":
+        await this.handleApprovalCommand(channel, message, arg);
+        return;
+
+      case "/approve":
+        await this.handleApproveCommand(channel, message, arg);
+        return;
+
+      case "/deny":
+        await this.handleDenyCommand(channel, message);
         return;
 
       case "/review":
@@ -651,6 +694,165 @@ export class Gateway {
     });
   }
 
+  private async handleSandboxCommand(channel: Channel, message: InboundMessage, arg: string): Promise<void> {
+    if (!arg) {
+      const preference = this.getUserPreference(message.senderId);
+      await this.sendOnce(channel, {
+        targetId: message.senderId,
+        replyToken: message.replyToken,
+        text: `sandbox: ${preference.sandboxMode}`,
+      });
+      return;
+    }
+
+    const normalized = arg.toLowerCase();
+    if (normalized !== "default" && !isSandboxCommand(normalized)) {
+      await this.sendOnce(channel, {
+        targetId: message.senderId,
+        replyToken: message.replyToken,
+        text: "Usage: /sandbox read-only|workspace-write|danger-full-access|default",
+      });
+      return;
+    }
+
+    this.config.userPreferences ||= {};
+    this.config.userPreferences[message.senderId] ||= {};
+    if (normalized === "default") {
+      delete this.config.userPreferences[message.senderId]!.sandboxMode;
+    } else {
+      this.config.userPreferences[message.senderId]!.sandboxMode = normalized;
+    }
+    await saveConfig(this.config);
+    const preference = this.getUserPreference(message.senderId);
+    await this.sendOnce(channel, {
+      targetId: message.senderId,
+      replyToken: message.replyToken,
+      text: `sandbox: ${preference.sandboxMode}`,
+    });
+  }
+
+  private async handleApprovalCommand(channel: Channel, message: InboundMessage, arg: string): Promise<void> {
+    if (!arg) {
+      const preference = this.getUserPreference(message.senderId);
+      await this.sendOnce(channel, {
+        targetId: message.senderId,
+        replyToken: message.replyToken,
+        text: `approval: ${preference.approvalPolicy}`,
+      });
+      return;
+    }
+
+    const normalized = arg.toLowerCase();
+    if (normalized !== "default" && !isApprovalCommand(normalized)) {
+      await this.sendOnce(channel, {
+        targetId: message.senderId,
+        replyToken: message.replyToken,
+        text: "Usage: /approval never|on-request|default",
+      });
+      return;
+    }
+
+    this.config.userPreferences ||= {};
+    this.config.userPreferences[message.senderId] ||= {};
+    if (normalized === "default") {
+      delete this.config.userPreferences[message.senderId]!.approvalPolicy;
+    } else {
+      this.config.userPreferences[message.senderId]!.approvalPolicy = normalized;
+    }
+    await saveConfig(this.config);
+    const preference = this.getUserPreference(message.senderId);
+    await this.sendOnce(channel, {
+      targetId: message.senderId,
+      replyToken: message.replyToken,
+      text: `approval: ${preference.approvalPolicy}`,
+    });
+  }
+
+  private async handleApproveCommand(channel: Channel, message: InboundMessage, arg: string): Promise<void> {
+    const sessionId = this.sessionKey(message);
+    const pending = this.pendingApprovals.get(sessionId);
+    if (!pending) {
+      await this.sendOnce(channel, {
+        targetId: message.senderId,
+        replyToken: message.replyToken,
+        text: "No pending approval request for this thread.",
+      });
+      return;
+    }
+
+    const normalized = arg.trim().toLowerCase();
+    const grantedSandbox = normalized
+      ? (isSandboxCommand(normalized) ? normalized : undefined)
+      : pending.suggestedSandbox;
+    if (!grantedSandbox || grantedSandbox === "read-only") {
+      await this.sendOnce(channel, {
+        targetId: message.senderId,
+        replyToken: message.replyToken,
+        text: "Usage: /approve [workspace-write|danger-full-access]",
+      });
+      return;
+    }
+
+    this.pendingApprovals.delete(sessionId);
+    await channel.sendTyping?.(message.senderId, message.replyToken);
+    log.info(
+      `批准待处理任务 [${shortUserId(message.senderId)}] `
+      + `(session: ${sessionId}, sandbox: ${grantedSandbox})`,
+    );
+
+    const provider = this.providers.get("codex");
+    if (!provider) {
+      throw new Error("Codex execution provider is not configured.");
+    }
+
+    const result = await provider.query(pending.prompt, {
+      sessionId: pending.sessionId,
+      codexHome: this.config.codexHome,
+      provider: pending.provider,
+      model: pending.model,
+      workspace: pending.workspace,
+      sandboxMode: grantedSandbox,
+      approvalPolicy: "never",
+      reasoningEffort: pending.reasoningEffort,
+      personality: pending.personality,
+      systemPrompt: pending.systemPrompt,
+      media: pending.media,
+      search: pending.search,
+      mcpTools: this.mcp.getOpenAITools(),
+      mcpCallTool: (name: string, args: Record<string, unknown>) => this.mcp.callTool(name, args),
+    });
+
+    const responseText = this.withApprovalNotice(message, result.text, result.approvalRequest, {
+      sessionId: pending.sessionId,
+      prompt: pending.prompt,
+      media: pending.media,
+      workspace: pending.workspace,
+      provider: pending.provider,
+      model: pending.model,
+      reasoningEffort: pending.reasoningEffort,
+      personality: pending.personality,
+      systemPrompt: pending.systemPrompt,
+      search: pending.search,
+      grantedSandbox,
+    });
+
+    await this.sendOnce(channel, {
+      targetId: message.senderId,
+      replyToken: message.replyToken,
+      text: responseText,
+    });
+  }
+
+  private async handleDenyCommand(channel: Channel, message: InboundMessage): Promise<void> {
+    const sessionId = this.sessionKey(message);
+    const existed = this.pendingApprovals.delete(sessionId);
+    await this.sendOnce(channel, {
+      targetId: message.senderId,
+      replyToken: message.replyToken,
+      text: existed ? "Pending approval cleared." : "No pending approval request for this thread.",
+    });
+  }
+
   private async handlePlanCommand(channel: Channel, message: InboundMessage, arg: string): Promise<void> {
     if (!arg) {
       const preference = this.getUserPreference(message.senderId);
@@ -846,7 +1048,7 @@ export class Gateway {
       provider,
       model: override.model || codexState.effectiveModel,
       search: override.search ?? false,
-      sandboxMode: override.sandboxMode ?? "workspace-write",
+      sandboxMode: override.sandboxMode ?? "read-only",
       approvalPolicy: override.approvalPolicy ?? "never",
       reasoningEffort: override.reasoningEffort,
       personality: override.personality,
@@ -944,9 +1146,57 @@ export class Gateway {
 
   private async resetSession(userId: string, thread?: string): Promise<void> {
     const sessionId = `weixin:${userId}:${thread || this.config.userPreferences?.[userId]?.thread || "main"}`;
+    this.pendingApprovals.delete(sessionId);
     for (const provider of this.providers.values()) {
       provider.resetSession?.(sessionId);
     }
+  }
+
+  private withApprovalNotice(
+    message: InboundMessage,
+    text: string,
+    approvalRequest: { reason: string; suggestedSandbox: SandboxMode } | undefined,
+    pending: Omit<PendingApproval, "createdAt" | "suggestedSandbox" | "reason"> & { grantedSandbox: SandboxMode },
+  ): string {
+    const sessionId = pending.sessionId;
+    if (!approvalRequest) {
+      this.pendingApprovals.delete(sessionId);
+      return text.trim();
+    }
+
+    this.pendingApprovals.set(sessionId, {
+      sessionId: pending.sessionId,
+      prompt: pending.prompt,
+      media: pending.media,
+      workspace: pending.workspace,
+      provider: pending.provider,
+      model: pending.model,
+      reasoningEffort: pending.reasoningEffort,
+      personality: pending.personality,
+      systemPrompt: pending.systemPrompt,
+      search: pending.search,
+      suggestedSandbox: approvalRequest.suggestedSandbox,
+      reason: approvalRequest.reason,
+      createdAt: Date.now(),
+    });
+
+    const lines = [
+      text.trim(),
+      "",
+      "Approval required to continue this task.",
+      `current sandbox: ${pending.grantedSandbox}`,
+      `reason: ${approvalRequest.reason}`,
+      `send /approve ${approvalRequest.suggestedSandbox} to rerun once with more access`,
+      "send /deny to discard this pending approval request",
+      "use /sandbox if you want to change the default permission for future tasks",
+    ].filter(Boolean);
+
+    log.info(
+      `待批准任务 [${shortUserId(message.senderId)}] `
+      + `(session: ${sessionId}, suggested sandbox: ${approvalRequest.suggestedSandbox})`,
+    );
+
+    return lines.join("\n").trim();
   }
 
   private async resolveModelTarget(arg: string, currentProvider: string): Promise<{ provider: string; model?: string } | null> {
@@ -1065,7 +1315,8 @@ export class Gateway {
     await channel.sendTyping?.(ctx.message.senderId, ctx.message.replyToken);
     log.info(
       `调用 ${ctx.preference.provider} 处理中 [${shortUserId(ctx.message.senderId)}] `
-      + `(model: ${ctx.preference.model || "(provider default)"}, session: ${this.sessionKey(ctx.message)})`,
+      + `(model: ${ctx.preference.model || "(provider default)"}, session: ${this.sessionKey(ctx.message)}, `
+      + `sandbox: ${ctx.preference.sandboxMode}, approval: ${ctx.preference.approvalPolicy})`,
     );
     const result = await provider.query(ctx.prompt || ctx.message.text, {
       sessionId: this.sessionKey(ctx.message),
@@ -1073,6 +1324,8 @@ export class Gateway {
       provider: ctx.preference.provider,
       model: ctx.preference.model,
       workspace: ctx.state.workspace as string,
+      sandboxMode: ctx.preference.sandboxMode,
+      approvalPolicy: ctx.preference.approvalPolicy,
       reasoningEffort: ctx.preference.reasoningEffort,
       personality: ctx.preference.personality,
       systemPrompt: ctx.systemPrompt,
@@ -1082,13 +1335,27 @@ export class Gateway {
       mcpCallTool: ctx.state.mcpCallTool as any,
     });
 
+    const responseText = this.withApprovalNotice(ctx.message, result.text, result.approvalRequest, {
+      sessionId: this.sessionKey(ctx.message),
+      prompt: ctx.prompt || ctx.message.text,
+      media: ctx.message.media,
+      workspace: ctx.state.workspace as string,
+      provider: ctx.preference.provider,
+      model: ctx.preference.model,
+      reasoningEffort: ctx.preference.reasoningEffort,
+      personality: ctx.preference.personality,
+      systemPrompt: ctx.systemPrompt,
+      search: ctx.preference.search,
+      grantedSandbox: ctx.preference.sandboxMode,
+    });
+
     const autoVisionText = ctx.state.autoVisionModel
       ? `auto-switched to vision model: ${ctx.state.autoVisionModel}\n\n`
       : "";
     ctx.response = {
       targetId: ctx.message.senderId,
       replyToken: ctx.message.replyToken,
-      text: `${autoVisionText}${result.text}`.trim(),
+      text: `${autoVisionText}${responseText}`.trim(),
     };
   }
 
