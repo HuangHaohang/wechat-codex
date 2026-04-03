@@ -142,6 +142,22 @@ export interface UserPreference {
   thread?: string;
 }
 
+export interface PendingApprovalState {
+  sessionId: string;
+  prompt: string;
+  media?: MediaAttachment[];
+  workspace: string;
+  provider: string;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
+  personality?: Personality;
+  systemPrompt?: string;
+  search: boolean;
+  suggestedSandbox: SandboxMode;
+  reason: string;
+  createdAt: number;
+}
+
 export interface ResolvedUserPreference {
   provider: string;
   model?: string;
@@ -189,6 +205,7 @@ export interface WechatCodexConfig {
   skills?: Record<string, SkillConfig>;
   userWorkspaces?: Record<string, string>;
   userPreferences?: Record<string, UserPreference>;
+  pendingApprovals?: Record<string, PendingApprovalState>;
   codex?: LegacyCodexConfig;
 }
 

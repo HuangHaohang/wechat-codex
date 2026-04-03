@@ -18,6 +18,7 @@ import type {
   Middleware,
   NextFunction,
   OutboundMessage,
+  PendingApprovalState,
   Provider,
   ProviderConfig,
   ReasoningEffort,
@@ -39,21 +40,7 @@ interface MessageBuffer {
   timer: ReturnType<typeof setTimeout>;
 }
 
-interface PendingApproval {
-  sessionId: string;
-  prompt: string;
-  media?: MediaAttachment[];
-  workspace: string;
-  provider: string;
-  model?: string;
-  reasoningEffort?: ReasoningEffort;
-  personality?: Personality;
-  systemPrompt?: string;
-  search: boolean;
-  suggestedSandbox: SandboxMode;
-  reason: string;
-  createdAt: number;
-}
+type PendingApproval = PendingApprovalState;
 
 export class Gateway {
   private readonly channels = new Map<string, Channel>();
@@ -65,10 +52,12 @@ export class Gateway {
   private readonly queueNoticeSent = new Set<string>();
   private readonly seenMessages = new Map<string, number>();
   private readonly sentReplies = new Map<string, number>();
-  private readonly pendingApprovals = new Map<string, PendingApproval>();
+  private readonly pendingApprovals: Map<string, PendingApproval>;
   private readonly mcp = new McpManager();
 
-  constructor(private readonly config: WechatCodexConfig) {}
+  constructor(private readonly config: WechatCodexConfig) {
+    this.pendingApprovals = new Map(Object.entries(this.config.pendingApprovals || {}));
+  }
 
   use(middleware: Middleware): this {
     this.middlewares.push(middleware);
@@ -278,7 +267,7 @@ export class Gateway {
             `personality: ${preference.personality || "(default)"}`,
             `sandbox: ${preference.sandboxMode}`,
             `approval: ${preference.approvalPolicy}`,
-            `pending approval: ${this.pendingApprovals.has(this.sessionKey(message)) ? "yes" : "no"}`,
+            `pending approval: ${this.pendingApprovalSummary(this.sessionKey(message))}`,
             `plan mode: ${preference.planMode ? "on" : "off"}`,
             `search: ${preference.search ? "on" : "off"}`,
             `skill: ${skill}`,
@@ -793,7 +782,7 @@ export class Gateway {
       return;
     }
 
-    this.pendingApprovals.delete(sessionId);
+    await this.clearPendingApproval(sessionId);
     await channel.sendTyping?.(message.senderId, message.replyToken);
     log.info(
       `批准待处理任务 [${shortUserId(message.senderId)}] `
@@ -822,7 +811,7 @@ export class Gateway {
       mcpCallTool: (name: string, args: Record<string, unknown>) => this.mcp.callTool(name, args),
     });
 
-    const responseText = this.withApprovalNotice(message, result.text, result.approvalRequest, {
+    const responseText = await this.withApprovalNotice(message, result.text, result.approvalRequest, {
       sessionId: pending.sessionId,
       prompt: pending.prompt,
       media: pending.media,
@@ -845,7 +834,7 @@ export class Gateway {
 
   private async handleDenyCommand(channel: Channel, message: InboundMessage): Promise<void> {
     const sessionId = this.sessionKey(message);
-    const existed = this.pendingApprovals.delete(sessionId);
+    const existed = await this.clearPendingApproval(sessionId);
     await this.sendOnce(channel, {
       targetId: message.senderId,
       replyToken: message.replyToken,
@@ -1146,25 +1135,32 @@ export class Gateway {
 
   private async resetSession(userId: string, thread?: string): Promise<void> {
     const sessionId = `weixin:${userId}:${thread || this.config.userPreferences?.[userId]?.thread || "main"}`;
-    this.pendingApprovals.delete(sessionId);
+    await this.clearPendingApproval(sessionId);
     for (const provider of this.providers.values()) {
       provider.resetSession?.(sessionId);
     }
   }
 
-  private withApprovalNotice(
+  private async withApprovalNotice(
     message: InboundMessage,
     text: string,
     approvalRequest: { reason: string; suggestedSandbox: SandboxMode } | undefined,
     pending: Omit<PendingApproval, "createdAt" | "suggestedSandbox" | "reason"> & { grantedSandbox: SandboxMode },
-  ): string {
+  ): Promise<string> {
     const sessionId = pending.sessionId;
     if (!approvalRequest) {
-      this.pendingApprovals.delete(sessionId);
-      return text.trim();
+      await this.clearPendingApproval(sessionId);
+      if (pending.grantedSandbox === "read-only") {
+        return text.trim();
+      }
+      return [
+        `Approved and reran this task with sandbox: ${pending.grantedSandbox}.`,
+        "",
+        text.trim(),
+      ].join("\n").trim();
     }
 
-    this.pendingApprovals.set(sessionId, {
+    await this.setPendingApproval(sessionId, {
       sessionId: pending.sessionId,
       prompt: pending.prompt,
       media: pending.media,
@@ -1180,11 +1176,15 @@ export class Gateway {
       createdAt: Date.now(),
     });
 
+    const approvalHeader = pending.grantedSandbox === "read-only"
+      ? "Approval required to continue this task."
+      : `I reran this task with sandbox: ${pending.grantedSandbox}, but it still needs more access.`;
     const lines = [
       text.trim(),
       "",
-      "Approval required to continue this task.",
+      approvalHeader,
       `current sandbox: ${pending.grantedSandbox}`,
+      `next suggested sandbox: ${approvalRequest.suggestedSandbox}`,
       `reason: ${approvalRequest.reason}`,
       `send /approve ${approvalRequest.suggestedSandbox} to rerun once with more access`,
       "send /deny to discard this pending approval request",
@@ -1197,6 +1197,34 @@ export class Gateway {
     );
 
     return lines.join("\n").trim();
+  }
+
+  private async setPendingApproval(sessionId: string, pending: PendingApproval): Promise<void> {
+    this.pendingApprovals.set(sessionId, pending);
+    this.config.pendingApprovals ||= {};
+    this.config.pendingApprovals[sessionId] = pending;
+    await saveConfig(this.config);
+  }
+
+  private async clearPendingApproval(sessionId: string): Promise<boolean> {
+    const existed = this.pendingApprovals.delete(sessionId);
+    if (!existed) {
+      return false;
+    }
+
+    if (this.config.pendingApprovals) {
+      delete this.config.pendingApprovals[sessionId];
+    }
+    await saveConfig(this.config);
+    return true;
+  }
+
+  private pendingApprovalSummary(sessionId: string): string {
+    const pending = this.pendingApprovals.get(sessionId);
+    if (!pending) {
+      return "no";
+    }
+    return `${pending.suggestedSandbox} (${ageLabel(pending.createdAt)})`;
   }
 
   private async resolveModelTarget(arg: string, currentProvider: string): Promise<{ provider: string; model?: string } | null> {
@@ -1335,7 +1363,7 @@ export class Gateway {
       mcpCallTool: ctx.state.mcpCallTool as any,
     });
 
-    const responseText = this.withApprovalNotice(ctx.message, result.text, result.approvalRequest, {
+    const responseText = await this.withApprovalNotice(ctx.message, result.text, result.approvalRequest, {
       sessionId: this.sessionKey(ctx.message),
       prompt: ctx.prompt || ctx.message.text,
       media: ctx.message.media,
@@ -1485,6 +1513,19 @@ function formatResolvedModel(
     return defaultModel;
   }
   return "(provider default)";
+}
+
+function ageLabel(createdAt: number): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - createdAt) / 1000));
+  if (seconds < 60) {
+    return `${seconds}s ago`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  }
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ago`;
 }
 
 function isReasoningEffort(value: string): value is ReasoningEffort {

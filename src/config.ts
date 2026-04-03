@@ -189,6 +189,7 @@ const DEFAULT_CONFIG: WechatCodexConfig = {
   skills: {},
   userWorkspaces: {},
   userPreferences: {},
+  pendingApprovals: {},
 };
 
 export async function ensureDir(dir: string): Promise<void> {
@@ -220,6 +221,7 @@ export async function loadConfig(): Promise<WechatCodexConfig> {
     skills: migrated.skills || {},
     userWorkspaces: migrated.userWorkspaces || {},
     userPreferences: migrated.userPreferences || {},
+    pendingApprovals: migrated.pendingApprovals || {},
   };
   merged.codexHome = resolve(merged.codexHome);
   await ensureCodexHome(merged.codexHome);
